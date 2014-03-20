@@ -46,6 +46,7 @@ BOOLEANS = BOOLEANS_TRUE + BOOLEANS_FALSE
 
 import os
 import re
+import pipes
 import shlex
 import subprocess
 import sys
@@ -59,6 +60,7 @@ import grp
 import pwd
 import platform
 import errno
+import tempfile
 
 try:
     import json
@@ -111,7 +113,9 @@ FILE_COMMON_ARGUMENTS=dict(
     content = dict(),
     backup = dict(),
     force = dict(),
+    remote_src = dict(), # used by assemble
 )
+
 
 def get_platform():
     ''' what's the platform?  example: Linux is a platform. '''
@@ -122,8 +126,11 @@ def get_distribution():
     if platform.system() == 'Linux':
         try:
             distribution = platform.linux_distribution()[0].capitalize()
-            if distribution == 'NA':
-                if os.path.is_file('/etc/system-release'):
+            if not distribution and os.path.isfile('/etc/system-release'):
+                distribution = platform.linux_distribution(supported_dists=['system'])[0].capitalize()
+                if 'Amazon' in distribution:
+                    distribution = 'Amazon'
+                else:
                     distribution = 'OtherLinux'
         except:
             # FIXME: MethodMissing, I assume?
@@ -172,6 +179,7 @@ class AnsibleModule(object):
         self.argument_spec = argument_spec
         self.supports_check_mode = supports_check_mode
         self.check_mode = False
+        self.no_log = no_log
         
         self.aliases = {}
         
@@ -183,13 +191,18 @@ class AnsibleModule(object):
         os.environ['LANG'] = MODULE_LANG
         (self.params, self.args) = self._load_params()
 
-        self._legal_inputs = [ 'CHECKMODE' ]
+        self._legal_inputs = ['CHECKMODE', 'NO_LOG']
         
         self.aliases = self._handle_aliases()
 
         if check_invalid_arguments:
             self._check_invalid_arguments()
         self._check_for_check_mode()
+        self._check_for_no_log()
+
+        # check exclusive early 
+        if not bypass_checks:
+            self._check_mutually_exclusive(mutually_exclusive)
 
         self._set_defaults(pre=True)
 
@@ -197,13 +210,15 @@ class AnsibleModule(object):
             self._check_required_arguments()
             self._check_argument_values()
             self._check_argument_types()
-            self._check_mutually_exclusive(mutually_exclusive)
             self._check_required_together(required_together)
             self._check_required_one_of(required_one_of)
 
         self._set_defaults(pre=False)
-        if not no_log:
+        if not self.no_log:
             self._log_invocation()
+
+        # finally, make sure we're in a sane working dir
+        self._set_cwd()
 
     def load_file_common_arguments(self, params):
         '''
@@ -452,7 +467,7 @@ class AnsibleModule(object):
                 changed = True
         return changed
 
-    def set_file_attributes_if_different(self, file_args, changed):
+    def set_fs_attributes_if_different(self, file_args, changed):
         # set modes owners and context as needed
         changed = self.set_context_if_different(
             file_args['path'], file_args['secontext'], changed
@@ -469,19 +484,10 @@ class AnsibleModule(object):
         return changed
 
     def set_directory_attributes_if_different(self, file_args, changed):
-        changed = self.set_context_if_different(
-            file_args['path'], file_args['secontext'], changed
-        )
-        changed = self.set_owner_if_different(
-            file_args['path'], file_args['owner'], changed
-        )
-        changed = self.set_group_if_different(
-            file_args['path'], file_args['group'], changed
-        )
-        changed = self.set_mode_if_different(
-            file_args['path'], file_args['mode'], changed
-        )
-        return changed
+        return self.set_fs_attributes_if_different(file_args, changed)
+
+    def set_file_attributes_if_different(self, file_args, changed):
+        return self.set_fs_attributes_if_different(file_args, changed)
 
     def add_path_info(self, kwargs):
         '''
@@ -555,10 +561,16 @@ class AnsibleModule(object):
                 if self.supports_check_mode:
                     self.check_mode = True
 
+    def _check_for_no_log(self):
+        for (k,v) in self.params.iteritems():
+            if k == 'NO_LOG':
+                self.no_log = self.boolean(v)
+
     def _check_invalid_arguments(self):
         for (k,v) in self.params.iteritems():
-            if k == 'CHECKMODE':
-                continue
+            # these should be in legal inputs already
+            #if k in ('CHECKMODE', 'NO_LOG'):
+            #    continue
             if k not in self._legal_inputs:
                 self.fail_json(msg="unsupported parameter for module: %s" % k)
 
@@ -703,6 +715,12 @@ class AnsibleModule(object):
                         self.params[k] = int(value)
                     else:
                         is_invalid = True
+            elif wanted == 'float':
+                if not isinstance(value, float):
+                    if isinstance(value, basestring):
+                        self.params[k] = float(value)
+                    else:
+                        is_invalid = True
             else:
                 self.fail_json(msg="implementation error: unknown type %s requested for %s" % (wanted, k))
 
@@ -742,7 +760,13 @@ class AnsibleModule(object):
         # Sanitize possible password argument when logging.
         log_args = dict()
         passwd_keys = ['password', 'login_password']
-        
+
+        filter_re = [
+            # filter out things like user:pass@foo/whatever
+            # and http://username:pass@wherever/foo
+            re.compile('^(?P<before>.*:)(?P<password>.*)(?P<after>\@.*)$'), 
+        ]
+
         for param in self.params:
             canon  = self.aliases.get(param, param)
             arg_opts = self.argument_spec.get(canon, {})
@@ -753,12 +777,27 @@ class AnsibleModule(object):
             elif param in passwd_keys:
                 log_args[param] = 'NOT_LOGGING_PASSWORD'
             else:
-                log_args[param] = self.params[param]
+                found = False
+                for filter in filter_re:
+                    if isinstance(self.params[param], unicode):
+                        m = filter.match(self.params[param])
+                    else:
+                        m = filter.match(str(self.params[param]))
+                    if m:
+                        d = m.groupdict()
+                        log_args[param] = d['before'] + "********" + d['after']
+                        found = True
+                        break
+                if not found:
+                    log_args[param] = self.params[param]
 
         module = 'ansible-%s' % os.path.basename(__file__)
         msg = ''
         for arg in log_args:
-            msg = msg + arg + '=' + str(log_args[arg]) + ' '
+            if isinstance(log_args[arg], unicode):
+                msg = msg + arg + '=' + log_args[arg] + ' '
+            else:
+                msg = msg + arg + '=' + str(log_args[arg]) + ' '
         if msg:
             msg = 'Invoked with %s' % msg
         else:
@@ -773,11 +812,31 @@ class AnsibleModule(object):
                 journal.sendv(*journal_args)
             except IOError, e:
                 # fall back to syslog since logging to journal failed
-                syslog.openlog(module, 0, syslog.LOG_USER)
-                syslog.syslog(syslog.LOG_NOTICE, msg)
+                syslog.openlog(str(module), 0, syslog.LOG_USER)
+                syslog.syslog(syslog.LOG_NOTICE, unicode(msg).encode('utf8'))
         else:
-            syslog.openlog(module, 0, syslog.LOG_USER)
-            syslog.syslog(syslog.LOG_NOTICE, msg)
+            syslog.openlog(str(module), 0, syslog.LOG_USER)
+            syslog.syslog(syslog.LOG_NOTICE, unicode(msg).encode('utf8'))
+
+    def _set_cwd(self):
+        try:
+            cwd = os.getcwd()
+            if not os.access(cwd, os.F_OK|os.R_OK):
+                raise
+            return cwd
+        except:
+            # we don't have access to the cwd, probably because of sudo. 
+            # Try and move to a neutral location to prevent errors
+            for cwd in [os.path.expandvars('$HOME'), tempfile.gettempdir()]:
+                try:
+                    if os.access(cwd, os.F_OK|os.R_OK):
+                        os.chdir(cwd)
+                        return cwd
+                except:
+                    pass
+        # we won't error here, as it may *not* be a problem, 
+        # and we don't want to break modules unnecessarily
+        return None    
 
     def get_bin_path(self, arg, required=False, opt_dirs=[]):
         '''
@@ -821,7 +880,12 @@ class AnsibleModule(object):
             self.fail_json(msg='Boolean %s not in either boolean list' % arg)
 
     def jsonify(self, data):
-        return json.dumps(data)
+        for encoding in ("utf-8", "latin-1", "unicode_escape"):
+            try:
+                return json.dumps(data, encoding=encoding)
+            except UnicodeDecodeError, e:
+                continue
+        self.fail_json(msg='Invalid unicode encoding encountered')
 
     def from_json(self, data):
         return json.loads(data)
@@ -913,7 +977,7 @@ class AnsibleModule(object):
                 context = self.selinux_default_context(dest)
 
         try:
-            # Optimistically try a rename, solves some corner cases and can avoid useless work.
+            # Optimistically try a rename, solves some corner cases and can avoid useless work, throws exception if not atomic.
             os.rename(src, dest)
         except (IOError,OSError), e:
             # only try workarounds for errno 18 (cross device), 1 (not permited) and 13 (permission denied)
@@ -941,12 +1005,13 @@ class AnsibleModule(object):
             # rename might not preserve context
             self.set_context_if_different(dest, context, False)
 
-    def run_command(self, args, check_rc=False, close_fds=False, executable=None, data=None, binary_data=False, path_prefix=None):
+    def run_command(self, args, check_rc=False, close_fds=False, executable=None, data=None, binary_data=False, path_prefix=None, cwd=None, use_unsafe_shell=False):
         '''
         Execute a command, returns rc, stdout, and stderr.
         args is the command to run
         If args is a list, the command will be run with shell=False.
-        Otherwise, the command will be run with shell=True when args is a string.
+        If args is a string and use_unsafe_shell=False it will split args to a list and run with shell=False
+        If args is a string and use_unsafe_shell=True it run with shell=True.
         Other arguments:
         - check_rc (boolean)  Whether to call fail_json in case of
                               non zero RC.  Default is False.
@@ -955,13 +1020,24 @@ class AnsibleModule(object):
         - executable (string) See documentation for subprocess.Popen().
                               Default is None.
         '''
+
+        shell = False
         if isinstance(args, list):
-            shell = False
-        elif isinstance(args, basestring):
+            if use_unsafe_shell:
+                args = " ".join([pipes.quote(x) for x in args])
+                shell = True
+        elif isinstance(args, basestring) and use_unsafe_shell:
             shell = True
+        elif isinstance(args, basestring):
+            args = shlex.split(args)
         else:
             msg = "Argument 'args' to run_command must be list or string"
             self.fail_json(rc=257, cmd=args, msg=msg)
+
+        # expand things like $HOME and ~
+        if not shell:
+            args = [ os.path.expandvars(os.path.expanduser(x)) for x in args ]
+
         rc = 0
         msg = None
         st_in = None
@@ -971,40 +1047,84 @@ class AnsibleModule(object):
         if path_prefix:
             env['PATH']="%s:%s" % (path_prefix, env['PATH'])
 
+        # create a printable version of the command for use
+        # in reporting later, which strips out things like
+        # passwords from the args list
+        if isinstance(args, list):
+            clean_args = " ".join(pipes.quote(arg) for arg in args)
+        else:
+            clean_args = args
+
+        # all clean strings should return two match groups, 
+        # where the first is the CLI argument and the second 
+        # is the password/key/phrase that will be hidden
+        clean_re_strings = [
+            # this removes things like --password, --pass, --pass-wd, etc.
+            # optionally followed by an '=' or a space. The password can 
+            # be quoted or not too, though it does not care about quotes
+            # that are not balanced
+            # source: http://blog.stevenlevithan.com/archives/match-quoted-string
+            r'([-]{0,2}pass[-]?(?:word|wd)?[=\s]?)((?:["\'])?(?:[^\s])*(?:\1)?)',
+            # TODO: add more regex checks here
+        ]
+        for re_str in clean_re_strings:
+            r = re.compile(re_str)
+            clean_args = r.sub(r'\1********', clean_args)
+
         if data:
             st_in = subprocess.PIPE
+
+        kwargs = dict(
+            executable=executable,
+            shell=shell,
+            close_fds=close_fds,
+            stdin= st_in,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE 
+        )
+
+        if path_prefix:
+            kwargs['env'] = env
+        if cwd and os.path.isdir(cwd):
+            kwargs['cwd'] = cwd
+
+        # store the pwd
+        prev_dir = os.getcwd()
+
+        # make sure we're in the right working directory
+        if cwd and os.path.isdir(cwd):
+            try:
+                os.chdir(cwd)
+            except (OSError, IOError), e:
+                self.fail_json(rc=e.errno, msg="Could not open %s , %s" % (cwd, str(e)))
+
         try:
-            if path_prefix is not None:
-                cmd = subprocess.Popen(args,
-                                       executable=executable,
-                                       shell=shell,
-                                       close_fds=close_fds,
-                                       stdin=st_in,
-                                       stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE,
-                                       env=env)
-            else:
-                cmd = subprocess.Popen(args,
-                                       executable=executable,
-                                       shell=shell,
-                                       close_fds=close_fds,
-                                       stdin=st_in,
-                                       stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE)
-            
+            cmd = subprocess.Popen(args, **kwargs)
+
             if data:
                 if not binary_data:
-                    data += '\\n'
+                    data += '\n'
             out, err = cmd.communicate(input=data)
             rc = cmd.returncode
         except (OSError, IOError), e:
-            self.fail_json(rc=e.errno, msg=str(e), cmd=args)
+            self.fail_json(rc=e.errno, msg=str(e), cmd=clean_args)
         except:
-            self.fail_json(rc=257, msg=traceback.format_exc(), cmd=args)
+            self.fail_json(rc=257, msg=traceback.format_exc(), cmd=clean_args)
+
         if rc != 0 and check_rc:
             msg = err.rstrip()
-            self.fail_json(cmd=args, rc=rc, stdout=out, stderr=err, msg=msg)
+            self.fail_json(cmd=clean_args, rc=rc, stdout=out, stderr=err, msg=msg)
+
+        # reset the pwd
+        os.chdir(prev_dir)
+
         return (rc, out, err)
+
+    def append_to_file(self, filename, str):
+        filename = os.path.expandvars(os.path.expanduser(filename))
+        fh = open(filename, 'a')
+        fh.write(str)
+        fh.close()
 
     def pretty_bytes(self,size):
         ranges = (
@@ -1022,4 +1142,5 @@ class AnsibleModule(object):
                 break
         return '%.2f %s' % (float(size)/ limit, suffix)
 
-
+def get_module_path():
+    return os.path.dirname(os.path.realpath(__file__))
